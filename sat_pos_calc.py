@@ -4,11 +4,10 @@ from math import sqrt, sin, atan2, cos
 import numpy as np
 
 from data_structure.nav_data_structure import RINEXNavigationData
-from data_structure.sat_pos_data_structure import PositionData
 
 # Predefined Parameters
 GM = 3.986005e14
-omega_e = 7.292115e-5  # angular velocity of earth rotation
+omega_e = 7.2921151467e-5  # angular velocity of earth rotation
 
 NAV_FILE = 'data/brdc2360.18n'
 SP3_FILE = 'data/brdc2360.sp3'
@@ -29,22 +28,23 @@ data_format = [
     'send_time', 'sim_range', 'reserve1', 'reserve2'
 ]
 
+PRN_LIST = [f'G{i:02n}' for i in range(1, 33)]
+
 
 class SatellitePositionCalc:
 
-    def __init__(self):
-        self.RINEX = RINEXNavigationData(NAV_FILE)
-        self.sp3 = PositionData(SP3_FILE, "SP3")
-        self.pos = PositionData(POS_FILE, "POS")
+    def __init__(self, nav_file, sp3_file):
+        self.RINEX = RINEXNavigationData(nav_file)
+        self.sp3 = pd.read_table(sp3_file, sep=r'\s+', header=0)
 
-    def satellite_position(self, prn, nav_time, calc_time):
+    def instant_pos_calc(self, prn, nav_time, calc_time):
         """
-        Calculate satellite position using nav_date in nav_time
-        after calc_time in sec
+        Calculate instant satellite position in calc_time using ephemeris in nav_time
         """
 
-        condition = lambda bl: bl.toc == nav_time and bl.PRN == prn
-        orbit_data = next(filter(condition, self.RINEX.blocks))
+        orbit_data = next(
+            filter(lambda bl: bl.toc == nav_time and bl.PRN == prn, self.RINEX.blocks)
+        )
 
         [
             PRN, toc, a0, a1, a2,
@@ -95,94 +95,77 @@ class SatellitePositionCalc:
 
         L = Omega0 + Omega_dot * dt - omega_e * t
 
-        coor = [
+        coord = [
             x * cos(L) - y * cos(i) * sin(L),
             x * sin(L) + y * cos(i) * cos(L),
             y * sin(i)
         ]
+        return coord
 
-        return coor
-
-    def compare_with_sp3(self, prn, sod, computed_pos, print_dxdydz=False):
-
-        # XYZ_pos = self.pos.get_pos_item(PRN=prn, SOD=sod).XYZ
-
+    def instant_pos_eval(self, prn, calc_time, computed_pos, allow_print=True):
+        """Evaluate error of instant satellite position by compare calculated and .sp3 data"""
+        sod = self.sod(calc_time)
+        sp3_err = np.nan
+        sp3_delta = [np.nan for _ in range(3)]
         try:
-            XYZ_sp3 = self.sp3.get_pos_item(PRN=prn, SOD=sod).XYZ
+            xyz_sp3 = self.sp3[(self.sp3['prn'] == prn) & (self.sp3['sod'] == sod)].values[0, -3:]
 
         except Exception:
-            sp3_err = 0
-            print(f"No Such SP3 Data in sod {sod}")
+            print(f"No Such SP3 Data in {calc_time}(sod {sod}) of prn {prn}")
         else:
-            print(f'Calculated Satellite Position {computed_pos}')
-            # pos_err, pos_delta = self.calc_3d_point_error(XYZ_pos, computed_pos)
-            sp3_err, sp3_delta = self.calc_3d_point_error(XYZ_sp3, computed_pos)
-
-            # print(f'Error between .pos_calc {pos_err}')
-            print(f'Error between .sp3 and calculated position {sp3_err}')
-            if print_dxdydz:
-                # print(f'Delta between .pos_calc  {pos_delta}')
-                print(f'Delta between .sp3 and calculated position {sp3_delta}')
-
-        return sp3_err
-
-    def calc_sat_pos_in_diff_time(self, prn, nav_times, calc_times):
-        errs = []
-        for nav_time in nav_times:
-            for calc_time in calc_times:
-                print(f"Navigation  {nav_time}\n"
-                      f"Calculation {calc_time}")
-                # Second of day
-                tgt_sod = self.sod(calc_time)
-                xyz = self.satellite_position(prn, nav_time, calc_time)
-                err = self.compare_with_sp3(prn, tgt_sod, xyz, True)
-                errs.append(err)
+            sp3_err, sp3_delta = self.calc_3d_point_error(xyz_sp3, computed_pos)
+            if allow_print:
+                print(f'Calculated Position of {prn} in {calc_time}\n{computed_pos}')
+                print(f'Difference of X Y Z between .sp3 and calculated position\n{sp3_delta}')
+                print(f'Error between .sp3 and calculated position {sp3_err}')
                 print()
+        return sp3_err, sp3_delta
 
-        return np.array(errs).reshape(len(nav_times), len(calc_times))
+    # def diff_nav_calc_times(self, prn, nav_times, calc_times):
+    #     err = []
+    #     for nav_time in nav_times:
+    #         for calc_time in calc_times:
+    #             print(f"Navigation  {nav_time}\n"
+    #                   f"Calculation {calc_time}")
+    #             # Second of day
+    #             tgt_sod = self.sod(calc_time)
+    #             xyz = self.instant_pos_calc(prn, nav_time, calc_time)
+    #             err, _ = self.instant_pos_eval(prn, tgt_sod, xyz)
+    #             err.append(err)
+    #             print()
+    #
+    #     return np.array(err).reshape(len(nav_times), len(calc_times))
 
-    def _calc_whole_day_sat_pos(self, prn, f):
-        start = datetime(2018, 8, 24, 0, 0, 0)
-        end = datetime(2018, 8, 24, 23, 45, 00)
-        nums = int((end - start).total_seconds() / 30)
-        calc_times = [start + timedelta(seconds=30 * i) for i in range(nums + 1)]
+    def sat_orbit_calc(self):
+        start_date_time = datetime(2018, 8, 24, 0, 0, 0)
+        end_date_time = datetime(2018, 8, 24, 23, 45, 0)
+        nums = int((end_date_time - start_date_time).total_seconds() / 30)
+        calc_times = [start_date_time + timedelta(seconds=30 * i) for i in range(nums + 1)]
 
-        prn_nav_data = self.RINEX.get_nav_data(PRN=prn)
-        for calc_time in calc_times:
-            nav_time = min(prn_nav_data, key=lambda bl: abs(bl.toc - calc_time)).toc
-            print(f"PRN {prn}: Navigation {nav_time} => Calculation {calc_time}")
-            # Second of day
-            tgt_sod = self.sod(calc_time)
-            xyz = self.satellite_position(prn, nav_time, calc_time)
-            # compare_with_sp3(prn, tgt_sod, xyz)
+        calc_times_idx = pd.DatetimeIndex(calc_times)
+        columns = ['sod', 'prn', "x", "y", "z", 'ephemeris toc']
+        sats_orbit = []
+        for prn in PRN_LIST:
+            pos = []
+            prn_nav_data = self.RINEX.get_nav_data(PRN=prn)
+            for calc_time in calc_times:
+                # Find the nearest ephemeris to current calculated time
+                nav_time = min(prn_nav_data, key=lambda bl: abs(bl.toc - calc_time)).toc
+                xyz = self.instant_pos_calc(prn, nav_time, calc_time)
+                # self.instant_pos_eval(prn, nav_time, xyz)
 
-            x, y, z = xyz
-            print(f'{tgt_sod:>8.2f}{prn:>5}{x:>15.3f}{y:>15.3f}{z:>15.3f}', file=f)
-            # print()
+                pos.append([self.sod(calc_time), prn, *xyz, nav_time])
 
-    def calc_whole_day_sats_pos(self):
-        prns = [f'G{i:02n}' for i in range(1, 33)]
-        with open(CALC_FILE, 'w')as f:
-            print(f'{"sod":>8}{"prn":>5}{"x":>15}{"y":>15}{"z":>15}', file=f)
-            for prn in prns:
-                self._calc_whole_day_sat_pos(prn, f)
-
-    def analysis_errors(self):
-        prn = 'G01'
-
-        prn_nav_data = self.RINEX.get_nav_data(PRN=prn)
-        nav_times_errs = pd.DataFrame(index=[f"{i*30} minutes" for i in range(-2, 3)])
-        for nav in prn_nav_data:
-            nav_times = [nav.toc]
-            calc_times = [nav_times[0] + timedelta(minutes=i * 30) for i in range(-2, 3)]
-            errs = self.calc_sat_pos_in_diff_time(prn, nav_times, calc_times)
-            nav_times_errs[nav.toc] = errs.T
-        return nav_times_errs
+            sat_orbit = pd.DataFrame(np.array(pos), columns=columns, index=calc_times_idx)
+            sats_orbit.append(sat_orbit)
+            print(f'{prn} finished')
+        return pd.concat(sats_orbit)
 
     @staticmethod
     def calc_3d_point_error(p1, p2):
-        dxdydz = [i - j for i, j in zip(p1, p2)]
-        return sqrt(sum([(k ** 2) for k in dxdydz])), dxdydz
+        dx_dy_dz = [i - j for i, j in zip(p1, p2)]
+        ds = sqrt(sum([k ** 2 for k in dx_dy_dz]))
+        return ds, dx_dy_dz
 
     @staticmethod
     def get_gps_time(tgt_t):
@@ -208,34 +191,7 @@ class SatellitePositionCalc:
 
 
 if __name__ == '__main__':
-    pos_calc = SatellitePositionCalc()
+    calc = SatellitePositionCalc(NAV_FILE, SP3_FILE)
 
-    prn = "G01"
-
-    nav_times = [
-        datetime(2018, 8, 24, 0, 0, 0),
-        datetime(2018, 8, 24, 1, 30, 0),
-    ]
-    calc_times = [datetime(2018, 8, 24, 1, 0, 0)]
-
-    pos_calc.calc_sat_pos_in_diff_time(prn, nav_times, calc_times)
-
-    """
-    Navigation  2018-08-24 00:00:00
-    Calculation 2018-08-24 01:00:00
-    Calculated Satellite Position [-13205383.694849968, 15498118.166812062, 16724633.352198847]
-    Error between .sp3 and calculated position 12.048038938256509
-    Delta between .sp3 and calculated position [9.775849968194962, 7.019187938421965, 0.5648011527955532]
-
-    Navigation  2018-08-24 01:30:00
-    Calculation 2018-08-24 01:00:00
-    Calculated Satellite Position [-13205378.92409278, 15498114.71283738, 16724627.009004006]
-    Error between .sp3 and calculated position 13.507719929033005
-    Delta between .sp3 and calculated position [5.005092781037092, 10.47316262125969, 6.90799599327147]
-    """
-
-    pos_calc.calc_whole_day_sats_pos()
-
-    # df = pos_calc.analysis_errors()
-    # df.to_csv('errors/errors.csv')
+    calc.sat_orbit_calc()
     pass
